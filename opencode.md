@@ -488,7 +488,158 @@ Guidelines:
 
 ---
 
-## 六、设计最佳实践总结
+## 六、循环检测机制 (Doom Loop Detection)
+
+OpenCode 实现了一套完整的"死循环"检测机制，用于识别 AI 陷入重复调用相同工具、无限消耗 token 的异常情况。
+
+### 6.1 核心检测逻辑
+
+**位置**: `packages/opencode/src/session/processor.ts`
+
+```typescript
+const DOOM_LOOP_THRESHOLD = 3  // 阈值：连续3次相同调用
+
+// 在 tool-call 事件处理中
+case "tool-call": {
+  const parts = await MessageV2.parts(input.assistantMessage.id)
+  const lastThree = parts.slice(-DOOM_LOOP_THRESHOLD)
+
+  if (
+    lastThree.length === DOOM_LOOP_THRESHOLD &&
+    lastThree.every(
+      (p) =>
+        p.type === "tool" &&
+        p.tool === value.toolName &&                              // 相同工具
+        p.state.status !== "pending" &&
+        JSON.stringify(p.state.input) === JSON.stringify(value.input),  // 相同输入
+    )
+  ) {
+    // 触发 doom_loop 权限检查
+    await PermissionNext.ask({
+      permission: "doom_loop",
+      patterns: [value.toolName],
+      sessionID: input.assistantMessage.sessionID,
+      metadata: {
+        tool: value.toolName,
+        input: value.input,
+      },
+      always: [value.toolName],
+      ruleset: agent.permission,
+    })
+  }
+  break
+}
+```
+
+### 6.2 检测条件
+
+循环检测触发需要同时满足以下条件：
+
+1. **连续 3 次**（`DOOM_LOOP_THRESHOLD = 3`）
+2. **相同工具名称**（`p.tool === value.toolName`）
+3. **相同输入参数**（`JSON.stringify(p.state.input) === JSON.stringify(value.input)`）
+4. **工具已执行完成**（`p.state.status !== "pending"`）
+
+### 6.3 权限控制
+
+检测到循环后，通过权限系统决定如何处理：
+
+```typescript
+// Agent 默认权限配置
+{
+  "*": "allow",
+  "doom_loop": "ask",  // 默认：询问用户
+  // ...
+}
+```
+
+**三种处理方式**：
+| 权限值 | 行为 |
+|--------|------|
+| `allow` | 允许继续执行（不推荐） |
+| `ask` | **弹窗询问用户**是否继续（默认） |
+| `deny` | 直接拒绝，中断执行 |
+
+### 6.4 用户界面提示
+
+当检测到循环时，UI 会显示权限确认弹窗：
+
+```typescript
+// i18n 多语言支持
+"settings.permissions.tool.doom_loop.title": "Doom Loop",
+"settings.permissions.tool.doom_loop.description": "Detect repeated tool calls with identical input",
+
+// 中文
+"settings.permissions.tool.doom_loop.title": "Doom Loop",
+"settings.permissions.tool.doom_loop.description": "检测具有相同输入的重复工具调用",
+```
+
+### 6.5 配置选项
+
+可以在配置文件中调整行为：
+
+```jsonc
+// opencode.json
+{
+  "experimental": {
+    "continue_loop_on_deny": false  // 拒绝后是否继续循环（默认 false，即中断）
+  },
+  "permission": {
+    "doom_loop": "ask"  // 或 "allow" / "deny"
+  }
+}
+```
+
+### 6.6 设计启示
+
+**你可以参考的思路**：
+
+1. **基于历史窗口检测**
+   - 保留最近 N 次工具调用记录
+   - 比较工具名 + 序列化后的输入参数
+   - 阈值可配置（OpenCode 用的是 3）
+
+2. **权限系统解耦**
+   - 检测逻辑和处理逻辑分离
+   - 通过权限配置决定是中断、询问还是放行
+   - 支持按工具名细粒度配置
+
+3. **用户可感知**
+   - 弹窗告知用户发生了什么
+   - 提供元数据（哪个工具、什么输入）
+   - 让用户决定是否继续
+
+4. **其他可扩展的检测维度**（OpenCode 未实现，但可以考虑）：
+   - Token 消耗速率异常
+   - 单次会话总 token 上限
+   - 工具调用频率限制
+   - 输出内容相似度检测（不只是输入相同）
+   - 错误率监控（连续失败 N 次）
+
+### 6.7 完整流程图
+
+```
+工具调用请求
+     ↓
+获取当前消息的最近 3 个 tool parts
+     ↓
+检查是否全部是：
+  - 同一工具
+  - 相同输入
+  - 已完成状态
+     ↓
+   是 → 触发 doom_loop 权限检查
+         ↓
+       ask → 弹窗询问用户
+       deny → 抛出 RejectedError → 中断循环
+       allow → 继续执行
+     ↓
+   否 → 正常执行工具
+```
+
+---
+
+## 七、设计最佳实践总结
 
 ### 6.1 工具描述设计原则
 
@@ -532,7 +683,7 @@ Guidelines:
 
 ---
 
-## 七、工具清单速查
+## 八、工具清单速查
 
 | 工具 | 核心参数 | 返回值 | 不可或缺的原因 |
 |------|----------|--------|----------------|
@@ -553,7 +704,7 @@ Guidelines:
 
 ---
 
-## 八、参考资源
+## 九、参考资源
 
 - 工具实现目录: `packages/opencode/src/tool/`
 - System Prompt 目录: `packages/opencode/src/session/prompt/`
