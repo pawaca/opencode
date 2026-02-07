@@ -639,9 +639,273 @@ case "tool-call": {
 
 ---
 
-## 七、设计最佳实践总结
+## 七、上下文压缩机制 (Context Compaction)
 
-### 6.1 工具描述设计原则
+OpenCode 实现了两层上下文管理策略：**Prune（修剪）** 和 **Compaction（压缩）**，用于在长对话中控制 token 消耗。
+
+### 7.1 触发时机
+
+**位置**: `packages/opencode/src/session/compaction.ts` 和 `processor.ts`
+
+#### 自动触发条件
+
+```typescript
+// processor.ts:274 - 每个 step 结束时检查
+if (await SessionCompaction.isOverflow({ tokens: usage.tokens, model: input.model })) {
+  needsCompaction = true
+}
+
+// compaction.ts:30-38 - 溢出检测逻辑
+export async function isOverflow(input: { tokens, model }) {
+  const config = await Config.get()
+  if (config.compaction?.auto === false) return false  // 可配置禁用
+
+  const context = input.model.limit.context
+  if (context === 0) return false
+
+  const count = input.tokens.input + input.tokens.cache.read + input.tokens.output
+  const output = Math.min(input.model.limit.output, OUTPUT_TOKEN_MAX)
+  const usable = input.model.limit.input || context - output
+
+  return count > usable  // 当前 token 数超过可用上限
+}
+```
+
+**触发条件**：
+1. 当前轮次的 `input + cache_read + output` 超过模型可用上下文
+2. 配置中 `compaction.auto !== false`
+
+### 7.2 两层压缩策略
+
+#### 策略一：Prune（工具输出修剪）
+
+**目的**：清除旧的工具调用输出，保留结构
+
+```typescript
+// compaction.ts:41-43
+export const PRUNE_MINIMUM = 20_000   // 至少修剪 20k tokens 才执行
+export const PRUNE_PROTECT = 40_000   // 保护最近 40k tokens 的工具输出
+
+const PRUNE_PROTECTED_TOOLS = ["skill"]  // skill 工具输出不修剪
+```
+
+**修剪逻辑**：
+
+```typescript
+export async function prune(input: { sessionID: string }) {
+  // 从后往前遍历消息
+  for (let msgIndex = msgs.length - 1; msgIndex >= 0; msgIndex--) {
+    const msg = msgs[msgIndex]
+    if (msg.info.role === "user") turns++
+    if (turns < 2) continue  // 保护最近 2 轮对话
+    if (msg.info.role === "assistant" && msg.info.summary) break  // 遇到摘要就停止
+
+    for (const part of msg.parts) {
+      if (part.type === "tool" && part.state.status === "completed") {
+        if (PRUNE_PROTECTED_TOOLS.includes(part.tool)) continue  // 跳过受保护工具
+        if (part.state.time.compacted) break  // 已修剪过就停止
+
+        const estimate = Token.estimate(part.state.output)
+        total += estimate
+
+        if (total > PRUNE_PROTECT) {  // 超过保护阈值的部分
+          pruned += estimate
+          toPrune.push(part)
+        }
+      }
+    }
+  }
+
+  if (pruned > PRUNE_MINIMUM) {
+    for (const part of toPrune) {
+      part.state.time.compacted = Date.now()  // 标记为已修剪
+      await Session.updatePart(part)
+    }
+  }
+}
+```
+
+**修剪后的效果**：
+
+```typescript
+// message-v2.ts:546-547 - 转换为模型消息时
+const outputText = part.state.time.compacted
+  ? "[Old tool result content cleared]"  // 被修剪的显示占位符
+  : part.state.output
+
+const attachments = part.state.time.compacted
+  ? []  // 附件也清除
+  : (part.state.attachments ?? [])
+```
+
+#### 策略二：Compaction（AI 摘要压缩）
+
+**目的**：用 AI 生成对话摘要，替代完整历史
+
+**压缩 Agent 配置**：
+
+```typescript
+// agent.ts - compaction agent 定义
+compaction: {
+  name: "compaction",
+  mode: "primary",
+  native: true,
+  hidden: true,
+  prompt: PROMPT_COMPACTION,
+  permission: {
+    "*": "deny",  // 不允许任何工具调用
+  },
+  options: {},
+}
+```
+
+**压缩 Prompt**（`agent/prompt/compaction.txt`）：
+
+```
+You are a helpful AI assistant tasked with summarizing conversations.
+
+When asked to summarize, provide a detailed but concise summary of the conversation.
+Focus on information that would be helpful for continuing the conversation, including:
+- What was done
+- What is currently being worked on
+- Which files are being modified
+- What needs to be done next
+- Key user requests, constraints, or preferences that should persist
+- Important technical decisions and why they were made
+
+Your summary should be comprehensive enough to provide context but concise enough to be quickly understood.
+```
+
+**压缩请求 Prompt**：
+
+```typescript
+// compaction.ts:141-142
+const defaultPrompt =
+  "Provide a detailed prompt for continuing our conversation above. " +
+  "Focus on information that would be helpful for continuing the conversation, " +
+  "including what we did, what we're doing, which files we're working on, " +
+  "and what we're going to do next considering new session will not have access to our conversation."
+```
+
+### 7.3 压缩流程
+
+```
+                     每个 step 结束
+                          ↓
+              检查 isOverflow() → 否 → 继续正常执行
+                          ↓ 是
+              processor 返回 "compact"
+                          ↓
+              SessionCompaction.create() 创建压缩任务
+                          ↓
+              下一轮循环检测到 compaction part
+                          ↓
+              SessionCompaction.process() 执行压缩
+                          ↓
+    ┌─────────────────────┴─────────────────────┐
+    ↓                                           ↓
+使用 compaction agent              将完整对话历史发给 AI
+（禁用所有工具）                              ↓
+    ↓                              AI 生成摘要作为 summary message
+    ↓                                           ↓
+    └─────────────────────┬─────────────────────┘
+                          ↓
+              摘要消息标记 summary: true
+                          ↓
+              后续对话从摘要开始（截断历史）
+                          ↓
+              自动插入 "Continue if you have next steps"
+```
+
+### 7.4 历史截断逻辑
+
+```typescript
+// message-v2.ts:649-655 - 构建模型消息时
+for (const msg of messages.toReversed()) {
+  // 遇到已完成的 compaction part，停止向前遍历
+  if (
+    msg.info.role === "user" &&
+    completed.has(msg.info.id) &&
+    msg.parts.some((part) => part.type === "compaction")
+  )
+    break
+
+  // 遇到摘要消息，记录其父消息 ID
+  if (msg.info.role === "assistant" && msg.info.summary && msg.info.finish)
+    completed.add(msg.info.parentID)
+}
+```
+
+**效果**：压缩后，模型只能看到摘要消息及其后的对话，之前的历史被"遗忘"。
+
+### 7.5 配置选项
+
+```jsonc
+// opencode.json
+{
+  "compaction": {
+    "auto": true,    // 是否自动触发压缩（默认 true）
+    "prune": true    // 是否启用工具输出修剪（默认 true）
+  }
+}
+```
+
+**环境变量覆盖**：
+```bash
+OPENCODE_DISABLE_AUTOCOMPACT=1  # 禁用自动压缩
+OPENCODE_DISABLE_PRUNE=1        # 禁用修剪
+```
+
+### 7.6 插件扩展点
+
+```typescript
+// compaction.ts:136-139 - 允许插件注入上下文或替换 prompt
+const compacting = await Plugin.trigger(
+  "experimental.session.compacting",
+  { sessionID: input.sessionID },
+  { context: [], prompt: undefined },  // 默认值
+)
+
+const promptText = compacting.prompt ?? [defaultPrompt, ...compacting.context].join("\n\n")
+```
+
+### 7.7 设计启示
+
+**你可以参考的思路**：
+
+1. **两层压缩策略**
+   - **Prune（快速）**：只清除工具输出内容，保留调用记录
+   - **Compaction（彻底）**：AI 生成摘要，截断历史
+
+2. **保护机制**
+   - 保护最近 N 轮对话（避免丢失刚发生的上下文）
+   - 保护最近 N tokens 的工具输出
+   - 特定工具（如 skill）输出不修剪
+
+3. **渐进式压缩**
+   - 先尝试 prune（低成本）
+   - 仍然溢出再触发 compaction（需要 AI 调用）
+
+4. **摘要优先**
+   - 压缩后的摘要标记 `summary: true`
+   - 构建上下文时遇到摘要就停止向前遍历
+   - 新对话从摘要继续
+
+5. **用户可配置**
+   - 允许禁用自动压缩
+   - 允许禁用修剪
+   - 插件可以注入自定义压缩 prompt
+
+6. **其他可扩展思路**（OpenCode 未实现）：
+   - 基于重要性评分的选择性压缩
+   - 多级摘要（最近详细，远期概要）
+   - 关键信息提取（变量、文件名、决策）单独保存
+
+---
+
+## 八、设计最佳实践总结
+
+### 8.1 工具描述设计原则
 
 1. **开头说明工具用途**（一句话）
 2. **Usage 部分列举使用场景和限制**
@@ -649,7 +913,7 @@ case "tool-call": {
 4. **参数说明包含默认值和类型**
 5. **说明与其他工具的关系**（优先使用哪个）
 
-### 6.2 参数设计原则
+### 8.2 参数设计原则
 
 1. **必选参数最小化**
 2. **提供合理默认值**
@@ -657,14 +921,14 @@ case "tool-call": {
 4. **参数名语义清晰**
 5. **支持增量/分页获取**（大数据量场景）
 
-### 6.3 返回值设计原则
+### 8.3 返回值设计原则
 
 1. **主输出 `output` 面向用户可读**
 2. **元数据 `metadata` 面向程序处理**
 3. **提供 `title` 用于 UI 展示**
 4. **错误信息具体且可操作**
 
-### 6.4 System Prompt 设计原则
+### 8.4 System Prompt 设计原则
 
 1. **按模型能力差异化**
 2. **明确角色定位和目标**
@@ -673,7 +937,7 @@ case "tool-call": {
 5. **注入运行时环境信息**
 6. **强调禁止行为（用大写强调）**
 
-### 6.5 Agent 设计原则
+### 8.5 Agent 设计原则
 
 1. **单一职责**：每个 Agent 专注一类任务
 2. **最小权限**：只开放必要的工具和目录
@@ -683,7 +947,7 @@ case "tool-call": {
 
 ---
 
-## 八、工具清单速查
+## 九、工具清单速查
 
 | 工具 | 核心参数 | 返回值 | 不可或缺的原因 |
 |------|----------|--------|----------------|
@@ -704,7 +968,7 @@ case "tool-call": {
 
 ---
 
-## 九、参考资源
+## 十、参考资源
 
 - 工具实现目录: `packages/opencode/src/tool/`
 - System Prompt 目录: `packages/opencode/src/session/prompt/`
